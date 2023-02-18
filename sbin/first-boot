@@ -1,0 +1,110 @@
+#!/usr/bin/bash
+
+mount /boot &> /dev/null || true
+mount /boot/efi &> /dev/null || true
+
+root_dev_path=$(findmnt -nv -o SOURCE /)
+boot_dev_path=$(findmnt -nv -o SOURCE /boot)
+efi_dev_path=$(findmnt -n -o SOURCE /boot/efi)
+
+root_fstype=$(blkid -s TYPE -o value $root_dev_path)
+boot_fstype=$(blkid -s TYPE -o value $boot_dev_path)
+efi_fstype=$(blkid -s TYPE -o value $efi_dev_path)
+
+internal_install=$(echo $root_dev_path | grep '^/dev/nvme')
+
+# 1. randomize the UUID of the efi and root partitions
+if [ -n $internal_install ] && [[ $efi_fstype = 'vfat' ]]; then
+        echo -e "\nSetting $efi_dev label to EFI-MAGEIA"
+        dosfslabel $efi_dev_path 'EFI-MAGEIA'
+
+        echo -e '\nRandomizing EFI system partition UUID...'
+        efi_uuid_old=$(blkid -s UUID -o value $efi_dev_path)
+        echo -e "EFI partition uuid current: $efi_uuid_old\n"
+        fatlabel --volume-id --reset $efi_dev_path
+        sleep 2
+        efi_uuid_new=$(blkid -s UUID -o value $efi_dev_path)
+        echo -e "EFI partition uuid new: $efi_uuid_new\n"
+
+        if [ -n $efi_uuid_new ]; then
+            echo "Regenerating /etc/fstab..."
+            sed -i "s/$efi_uuid_old/$efi_uuid_new/" /etc/fstab
+            systemctl daemon-reload
+        fi
+    # only support randomizing the UUID of ext4 root partitions
+    # btrfs is not supported as you can't change the UUID of a btrfs partiton while it's mounted
+    if [[ $root_fstype == 'ext4' ]]; then
+        echo "Randomizing root filesystem UUID..."
+        root_uuid_old=$(blkid -s UUID -o value $root_dev_path)
+        if [ -n $root_uuid_old ]; then
+            tune2fs -U random $root_dev_path
+            root_uuid_new=$(blkid -s UUID -o value $root_dev_path)
+            echo "Root filesystem: $root_uuid_new"
+
+            if [[ $root_uuid_old != $root_uuid_new ]]; then
+                echo "Regenerating /etc/fstab..."
+                sed -i "s/$root_uuid_old/$root_uuid_new/" /etc/fstab
+            fi
+        fi
+    fi
+fi
+
+# 2. expand the /boot filesystem
+if [ -n $internal_install ]; then
+    if [[ $boot_dev_path != $root_dev_path ]]; then
+        if [[ $boot_fstype == 'ext4' ]]; then
+          echo -e "\nresize2fs "
+          resize2fs $boot_dev_path
+        fi
+    fi
+
+# 3. expand the root partition and filesystem
+# this is quite a simple method...there's room for improvement
+
+    part_id=$(echo $root_dev_path | egrep -o 'p[0-9]+$')
+    part_num=$(echo $part_id | tr -d 'p')
+    root_disk=$(echo $root_dev_path | sed "s/$part_id$//")
+
+    echo -e "\ngrowpart $root_disk $part_num"
+    # don't fail if partition doesn't need to be expanded
+    growpart $root_disk $part_num || true
+
+    if [ $root_fstype == 'btrfs' ]; then
+        echo -e "\nbtrfs filesystem resize max /"
+        btrfs filesystem resize max /
+
+    elif [ $root_fstype == 'ext4' ]; then
+        echo -e "\nresize2fs $root_dev_path"
+        resize2fs $root_dev_path
+    fi
+fi
+
+# 4. generate a new machine-id
+if [ ! -e /etc/machine-id ]; then
+    systemd-machine-id-setup
+    echo "KERNEL_INSTALL_MACHINE_ID=$(cat /etc/machine-id)" > /etc/machine-info
+
+    # create new BLS entries
+    # this is needed as the /etc/machine-id value has been changed
+
+    rm -f /boot/loader/entries/*.conf
+
+    installed_kernels=$(rpm -q kernel | sed 's/kernel-//')
+
+    # kernel-install will call dracut, so no need to run that separately
+    for kernel_version in $installed_kernels
+    do
+        kernel-install add $kernel_version /lib/modules/$kernel_version/vmlinuz
+    done
+else
+    dracut -f
+fi
+
+# 5. extract firmware
+[[ -f /usr/sbin/asahi-fwextract ]] && /usr/sbin/asahi-fwextract
+
+# 6. set selinux to enforcing'
+sed -i 's/^SELINUX=.*$/SELINUX=enforcing/' /etc/selinux/config
+
+# 7. relabel filesystem
+/usr/libexec/selinux/selinux-autorelabel
